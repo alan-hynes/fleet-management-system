@@ -1,0 +1,224 @@
+const express = require("express");
+const cors = require("cors");
+const http = require("http");
+const { Server } = require("socket.io");
+const mongoose = require("mongoose");
+require("dotenv").config();
+
+/* ---------- Schemas ---------- */
+const vehicleSchema = new mongoose.Schema({
+  id: String, address: String, lat: Number, lng: Number,
+  status: String, lastUpdated: Date, alert: String,
+});
+const Vehicle = mongoose.model("Vehicle", vehicleSchema);
+
+const vehicleHistorySchema = new mongoose.Schema({
+  vehicleId: String, lat: Number, lng: Number, timestamp: Date,
+});
+const VehicleHistory = mongoose.model("VehicleHistory", vehicleHistorySchema);
+
+const geofenceSchema = new mongoose.Schema({
+  id: String, name: String, type: String, coordinates: Array, radius: Number,
+  alertOnEntry: Boolean, alertOnExit: Boolean, createdAt: Date
+});
+const Geofence = mongoose.model("Geofence", geofenceSchema);
+
+const violationSchema = new mongoose.Schema({
+  vehicleId: String, geofenceId: String, geofenceName: String,
+  violationType: String, lat: Number, lng: Number, timestamp: Date,
+  notificationSent: Boolean, resolved: { type: Boolean, default: false },
+  resolvedAt: Date
+});
+const Violation = mongoose.model("Violation", violationSchema);
+
+/* ---------- DB ---------- */
+mongoose.connect(process.env.MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true })
+  .then(() => { console.log("Connected to MongoDB"); seedDatabase(); })
+  .catch((e) => console.error("Error connecting to MongoDB:", e));
+
+/* ---------- App ---------- */
+const app = express(); const port = 3001;
+app.use(cors({ origin: "*", methods: ["GET","POST","PATCH","DELETE"] }));
+app.use(express.json());
+app.use(express.urlencoded({ extended: true })); // for form posts
+
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: "*" } });
+
+/* ---------- Geofence helpers ---------- */
+function calculateDistance(lat1,lng1,lat2,lng2){
+  const R=6371, dLat=(lat2-lat1)*Math.PI/180, dLng=(lng2-lng1)*Math.PI/180;
+  const a=Math.sin(dLat/2)**2+Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*Math.sin(dLng/2)**2;
+  return 2*R*Math.atan2(Math.sqrt(a),Math.sqrt(1-a))*1000;
+}
+function pointInPolygon(lat,lng,poly){let inside=false;
+  for(let i=0,j=poly.length-1;i<poly.length;j=i++){
+    const xi=poly[i][0], yi=poly[i][1], xj=poly[j][0], yj=poly[j][1];
+    if(((yi>lat)!==(yj>lat))&&(lng<(xj-xi)*(lat-yi)/(yj-yi)+xi)) inside=!inside;
+  } return inside;
+}
+async function checkGeofences(vehicleId,lat,lng,prevLat,prevLng){
+  const fences=await Geofence.find({});
+  for(const g of fences){
+    let was=false,is=false;
+    if(g.type==='polygon'){
+      is=pointInPolygon(lat,lng,g.coordinates);
+      was=(prevLat!=null&&prevLng!=null)?pointInPolygon(prevLat,prevLng,g.coordinates):false;
+    }else if(g.type==='circle'){
+      const dNow=calculateDistance(lat,lng,g.coordinates[1],g.coordinates[0]);
+      const dPrev=(prevLat!=null&&prevLng!=null)?calculateDistance(prevLat,prevLng,g.coordinates[1],g.coordinates[0]):Infinity;
+      is=dNow<=g.radius; was=dPrev<=g.radius;
+    }
+    if(!was&&is&&g.alertOnEntry) await Violation.create({vehicleId,geofenceId:g.id,geofenceName:g.name,violationType:'entry',lat,lng,timestamp:new Date(),notificationSent:false});
+    if(was&&!is&&g.alertOnExit) await Violation.create({vehicleId,geofenceId:g.id,geofenceName:g.name,violationType:'exit',lat,lng,timestamp:new Date(),notificationSent:false});
+  }
+}
+
+/* ---------- Parse helpers (robust Overland/Pi) ---------- */
+function toNum(x){ const n=Number(x); return Number.isFinite(n)?n:null; }
+function extractOverlandShape(b){
+  // 1) GeoJSON-like: { current: { geometry: { coordinates: [lng,lat] }, properties: { device_id } } }
+  if (b?.current?.geometry?.coordinates?.length>=2){
+    return {
+      id: b.current.properties?.device_id || b.current.device_id || b.device || b.id,
+      lat: toNum(b.current.geometry.coordinates[1]),
+      lng: toNum(b.current.geometry.coordinates[0]),
+      status: b.current.properties?.activity || b.activity || 'moving'
+    };
+  }
+  // 2) Array of points: { locations: [ { geometry: { coordinates:[lng,lat] } } ] }
+  if (Array.isArray(b?.locations) && b.locations.length){
+    const loc = b.locations[b.locations.length-1];
+    if (loc?.geometry?.coordinates?.length>=2){
+      return {
+        id: loc.properties?.device_id || b.device || b.id,
+        lat: toNum(loc.geometry.coordinates[1]),
+        lng: toNum(loc.geometry.coordinates[0]),
+        status: loc.properties?.activity || b.activity || 'moving'
+      };
+    }
+    return {
+      id: loc.device || b.device || b.id,
+      lat: toNum(loc.latitude ?? loc.lat),
+      lng: toNum(loc.longitude ?? loc.lon ?? loc.lng),
+      status: loc.activity || loc.status || 'moving'
+    };
+  }
+  // 3) Flat post (form or JSON)
+  return {
+    id: b.device || b.device_id || b.vehicleId || b.id,
+    lat: toNum(b.latitude ?? b.lat),
+    lng: toNum(b.longitude ?? b.lon ?? b.lng),
+    status: b.activity || b.status || 'moving'
+  };
+}
+
+/* ---------- Single canonical upsert ---------- */
+async function upsertVehicle({ id, lat, lng, status='moving', address }){
+  if(!id) id='iphone-vehicle-1';
+  if(lat==null||lng==null) throw new Error('bad lat/lng');
+  const latN=toNum(lat), lngN=toNum(lng);
+  if(latN==null||lngN==null) throw new Error('bad lat/lng');
+
+  const prev=await Vehicle.findOne({ id });
+  await checkGeofences(id,latN,lngN,prev?.lat,prev?.lng);
+
+  const now=new Date();
+  await Vehicle.updateOne(
+    { id },
+    { id, address: address || `${id} (${latN.toFixed(6)}, ${lngN.toFixed(6)})`,
+      lat:latN, lng:lngN, status, lastUpdated: now, alert:"" },
+    { upsert:true }
+  );
+  await VehicleHistory.create({ vehicleId:id, lat:latN, lng:lngN, timestamp: now });
+
+  const snapshot=await Vehicle.find({});
+  io.emit('vehicleUpdate', snapshot);
+}
+
+/* ---------- Sockets ---------- */
+io.on("connection", async (socket)=>{
+  console.log("Client connected:", socket.id);
+  try { socket.emit("vehicleUpdate", await Vehicle.find({})); } catch(e){ console.error(e); }
+
+  const interval=setInterval(async ()=>{
+    const list=await Vehicle.find({});
+    for(const v of list){
+      if(v?.id && !v.id.startsWith('pi-') && !v.id.startsWith('iphone-')){
+        if(v.status==='moving'){
+          if(Math.random()<0.1) v.alert="breakdown";
+          else if(Math.random()<0.1) v.alert="idle";
+          else v.alert="";
+          v.lat+=(Math.random()-0.5)*0.01;
+          v.lng+=(Math.random()-0.5)*0.01;
+        }
+        v.lastUpdated=new Date(); await v.save();
+        await VehicleHistory.create({ vehicleId:v.id, lat:v.lat, lng:v.lng, timestamp:v.lastUpdated });
+      }
+    }
+    socket.emit("vehicleUpdate", await Vehicle.find({}));
+  },2000);
+
+  socket.on("disconnect", ()=>{ clearInterval(interval); console.log("Client disconnected:", socket.id); });
+});
+
+/* ---------- Seed (keeps pi-/iphone-) ---------- */
+async function seedDatabase(){
+  try{
+    await Vehicle.deleteMany({ id: { $not: { $regex:/^(pi-|iphone-)/ } } });
+    console.log("Cleared existing simulated vehicle data.");
+    await Vehicle.insertMany([
+      { id:"1", address:"Dublin, Ireland", lat:53.333, lng:-6.248, status:"stopped", lastUpdated:new Date(), alert:"" },
+      { id:"2", address:"Galway, Ireland", lat:53.270, lng:-9.057, status:"moving", lastUpdated:new Date(), alert:"" }
+    ]);
+    console.log("Sample data inserted into database.");
+  }catch(e){ console.error("Error seeding database:", e); }
+}
+
+/* ---------- REST ---------- */
+app.get("/health", (_req,res)=>res.json({ok:true}));
+app.get("/api/overland", (_req,res)=>res.json({ok:true}));
+app.get("/api/gps-update", (_req,res)=>res.json({ok:true}));
+
+app.get("/api/locations", async (_req,res)=>{ try{ res.json(await Vehicle.find({})); }catch(e){ res.status(500).json({error:"Internal server error"});} });
+app.get("/api/vehicle/:id/history", async (req,res)=>{ try{ res.json(await VehicleHistory.find({vehicleId:req.params.id}).sort({timestamp:1})); }catch(e){ res.status(500).json({error:"Internal server error"});} });
+app.post("/api/geofences", async (req,res)=>{ try{
+  const { id,name,type,coordinates,radius,alertOnEntry,alertOnExit }=req.body;
+  const g=new Geofence({ id:id||`geofence-${Date.now()}`, name, type:type||'circle', coordinates, radius:radius||null,
+    alertOnEntry: alertOnEntry!==false, alertOnExit: alertOnExit!==false, createdAt:new Date() });
+  await g.save(); res.json({success:true, geofence:g});
+}catch(e){ res.status(500).json({error:"internal server error"});} });
+app.get("/api/geofences", async (_req,res)=>{ try{ res.json(await Geofence.find({})); }catch(e){ res.status(500).json({error:"internal server error"});} });
+app.get("/api/violations", async (_req,res)=>{ try{ res.json(await Violation.find({}).sort({timestamp:-1})); }catch(e){ res.status(500).json({error:"internal server error"});} });
+app.get("/api/violations/:vehicleId", async (req,res)=>{ try{ res.json(await Violation.find({vehicleId:req.params.vehicleId}).sort({timestamp:-1})); }catch(e){ res.status(500).json({error:"internal server error"});} });
+
+/* ---------- Ingest (accepts Overland + Pi on BOTH paths) ---------- */
+app.post("/api/overland", async (req,res)=>{
+  console.log("Raw overland data:", JSON.stringify(req.body, null, 2));
+  try{
+    const p = extractOverlandShape(req.body||{});
+    await upsertVehicle(p);
+    res.json({ok:true});
+  }catch(e){ console.error("error processing /api/overland:", e); res.status(500).json({error:"internal server error"}); }
+});
+
+app.post("/api/gps-update", async (req,res)=>{
+  try{
+    // accept both simple JSON and Overland shapes here too
+    const b = req.body||{};
+    const p = (b.current || b.locations) ? extractOverlandShape(b) : {
+      id: b.vehicleId || b.id || b.device || 'iphone-vehicle-1',
+      lat: b.latitude ?? b.lat, lng: b.longitude ?? b.lon ?? b.lng,
+      status: b.status || b.activity || 'moving'
+    };
+    await upsertVehicle(p);
+    res.json({ok:true});
+  }catch(e){ console.error("error processing /api/gps-update:", e); res.status(500).json({error:"internal server error"}); }
+});
+
+/* ---------- Start ---------- */
+server.listen(port, ()=>console.log(`Backend running on http://localhost:${port}`));
+
+/* ---------- Additional API endpoints for frontend ---------- */
+app.delete("/api/geofences/:id", async (req,res)=>{ try{ await Geofence.findByIdAndDelete(req.params.id); res.json({success:true}); }catch(e){ res.status(500).json({error:"internal server error"});} });
+app.patch("/api/violations/:id/resolve", async (req,res)=>{ try{ const violation = await Violation.findByIdAndUpdate(req.params.id, { resolved: true, resolvedAt: new Date() }, { new: true }); res.json(violation); }catch(e){ res.status(500).json({error:"internal server error"});} });
