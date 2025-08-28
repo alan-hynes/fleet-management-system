@@ -5,3 +5,6 @@ node_modules/
 *.backup.*
 *.bak.*
 .env
+.env
+node_modules/
+*.log

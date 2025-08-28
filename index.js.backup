@@ -1,12 +1,9 @@
-const NotificationService = require("./notification-service");
 const express = require("express");
 const cors = require("cors");
 const http = require("http");
 const { Server } = require("socket.io");
 const mongoose = require("mongoose");
 require("dotenv").config();
-
-const notificationService = new NotificationService();
 
 /* ---------- Schemas ---------- */
 const vehicleSchema = new mongoose.Schema({
@@ -72,8 +69,8 @@ async function checkGeofences(vehicleId,lat,lng,prevLat,prevLng){
       const dPrev=(prevLat!=null&&prevLng!=null)?calculateDistance(prevLat,prevLng,g.coordinates[1],g.coordinates[0]):Infinity;
       is=dNow<=g.radius; was=dPrev<=g.radius;
     }
-    if(!was&&is&&g.alertOnEntry) { const newViolation = await Violation.create({vehicleId,geofenceId:g.id,geofenceName:g.name,violationType:'entry',lat,lng,timestamp:new Date(),notificationSent:false}); await notificationService.sendViolationAlert(newViolation); }
-    if(was&&!is&&g.alertOnExit) { const newViolation = await Violation.create({vehicleId,geofenceId:g.id,geofenceName:g.name,violationType:'exit',lat,lng,timestamp:new Date(),notificationSent:false}); await notificationService.sendViolationAlert(newViolation); }
+    if(!was&&is&&g.alertOnEntry) await Violation.create({vehicleId,geofenceId:g.id,geofenceName:g.name,violationType:'entry',lat,lng,timestamp:new Date(),notificationSent:false});
+    if(was&&!is&&g.alertOnExit) await Violation.create({vehicleId,geofenceId:g.id,geofenceName:g.name,violationType:'exit',lat,lng,timestamp:new Date(),notificationSent:false});
   }
 }
 
